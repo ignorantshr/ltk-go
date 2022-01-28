@@ -1,0 +1,7 @@
+server:
+  host: 127.0.0.1
+  port: 9001
+
+rocketmq:
+  host: 10.221.5.7
+  port: 9876

@@ -1,26 +1,39 @@
 package client
 
 import (
+	"common/config"
 	"common/entity"
-	"common/util"
-	"common/warrior"
+	"common/util/mq"
 	"fmt"
 	"github.com/apache/rocketmq-client-go/v2"
 	"github.com/gin-gonic/gin"
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"time"
 )
 
 var globalMq rocketmq.Producer
 // TODO get from configuration
-var addr string = "127.0.0.1:9876"
+var addr string
 
 func init() {
+	conf := config.GetConfig()
+	addr = fmt.Sprintf("%s:%d", conf.RocketMQ.Host, conf.RocketMQ.Port)
 	rand.Seed(time.Now().UnixNano())
 	// global mq to notice client's room info
-	globalMq = util.NewProducer(addr, "globalMq")
+	p, err := mq.NewProducer(addr, "globalMq")
+	if err != nil {
+		panic("failed to create global mq." + err.Error())
+	}
+	globalMq = p
+}
+
+func ShutdownMq(){
+	if globalMq != nil {
+		globalMq.Shutdown()
+	}
 }
 
 func RegistryRoutes(r *gin.Engine) {
@@ -30,10 +43,13 @@ func RegistryRoutes(r *gin.Engine) {
 			log.Println("Failed to get user from request: ", err)
 		}else {
 			user.Host = context.Request.Host
+			user.ResponseContext = context
 			log.Println("get connect from ", user.Host)
 			AddUserToPool(&user)
 		}
-		context.JSON(http.StatusOK, addr)
+		//context.JSON(http.StatusOK, dto.MqInfo{
+		//	Addr: addr,
+		//})
 	})
 }
 
@@ -58,17 +74,13 @@ func matchPlayers(pool *Pool) {
 
 		pool.IsW <- struct{}{}
 		var users []*entity.User
-		for i := 0; i < 5; i++ {
+		for i := 0; i < pool.roomType.PlayerNumber(); i++ {
 			n := rand.Intn(len(pool.idPool))
 			users = append(users, pool.playerPool[pool.idPool[n]])
 			delete(pool.playerPool, pool.idPool[n])
 			pool.idPool = append(pool.idPool[:n], pool.idPool[n+1:]...)
 		}
 		<-pool.IsW
-
-		for _, p := range users {
-			fmt.Println(p)
-		}
 
 		startRoom(users, pool.roomType)
 	}
@@ -88,9 +100,7 @@ func startRoom(users []*entity.User, roomType entity.RoomType) {
 	roles := roomType.Roles()
 	for i, u := range users {
 		index := rand.Intn(counts)
-		// TODO fill in the warrior
-		i++
-		players[i] = entity.NewPlayer(u, i, roles[index], warrior.NewZhangFei())
+		players[i] = entity.NewPlayer(u, i+1, roles[index], entity.NewZhangFei())
 		// dispatch cards to user
 		players[i].DispatchCards(room.Pile.DispatchCards(4, true))
 		if index == counts-1 {
@@ -101,6 +111,14 @@ func startRoom(users []*entity.User, roomType entity.RoomType) {
 		counts--
 	}
 	room.Players = players
+
+	for _, p := range room.Players {
+		p.User.ResponseContext.JSON(http.StatusOK, map[string]int64{"room": room.Id})
+		err := mq.SendMsg(globalMq, strconv.FormatInt(p.Id, 10), *room)
+		if err != nil {
+			fmt.Printf("failed to send msg to %d: %s", p.Id, err)
+		}
+	}
 
 	//jsonBytes, err := json.Marshal(room)
 	//if err != nil {
